@@ -1,5 +1,5 @@
 {
-    "name": "surface/drawing",
+    "name": "venusian-surface/drawing",
     "description": "Surface drawing: engine-free drawing contracts, the Painter and GPU regions over gpu.<engine>, the Rasterizer and five CPU engines over cpu.<engine>.",
     "license": "MIT",
     "authors": [
@@ -10,8 +10,8 @@
     ],
     "require": {
         "php": "^8.4|^8.5|^8.6",
-        "surface/contracts": "^0.8.0",
-        "surface/framebuffers": "^0.8.0",
+        "venusian-surface/contracts": "^0.8.0",
+        "venusian-surface/framebuffers": "^0.8.0",
         "venusian-voyager/contracts": "^0.8.0",
         "venusian-voyager/magic-aliases": "^0.8.0",
         "venusian-voyager/nuts-and-bolts": "^0.8.0"
