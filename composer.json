@@ -1,0 +1,48 @@
+{
+    "name": "surface/drawing",
+    "description": "Surface drawing: engine-free drawing contracts, the Painter and GPU regions over gpu.<engine>, the Rasterizer and five CPU engines over cpu.<engine>.",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Angel Gonzalez",
+            "email": "angel@projectsaturnstudios.com"
+        }
+    ],
+    "require": {
+        "php": "^8.4|^8.5|^8.6",
+        "surface/contracts": "^0.8.0",
+        "surface/framebuffers": "^0.8.0",
+        "venusian-voyager/contracts": "^0.8.0",
+        "venusian-voyager/magic-aliases": "^0.8.0",
+        "venusian-voyager/nuts-and-bolts": "^0.8.0"
+    },
+    "suggest": {
+        "jovian/venusian-sdl3": "^0.8.0 - The sdl3 stage host (engine-owned SDL windows) and the sdl3 GPU engine (SDL_GPU).",
+        "jovian/venusian-metal": "^0.8.0 - The metal GPU engine (macOS).",
+        "jovian/venusian-ogx": "^0.8.0 - The opengl GPU engine.",
+        "jovian/venusian-vulkan": "^0.8.0 - The vulkan GPU engine (MoltenVK on macOS, a lent VkSurfaceKHR elsewhere)."
+    },
+    "minimum-stability": "dev",
+    "autoload": {
+        "psr-4": {
+            "Surface\\Drawing\\": ""
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "extra": {
+        "branch-alias": {
+            "dev-main": "0.8.x-dev"
+        },
+        "venusian": {
+            "providers": [
+                "Surface\\Drawing\\DrawingServiceProvider"
+            ],
+            "aliases": {
+                "GPU": "Surface\\Drawing\\MagicAliases\\GPU",
+                "CPU": "Surface\\Drawing\\MagicAliases\\CPU"
+            }
+        }
+    }
+}
