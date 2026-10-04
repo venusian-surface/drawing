@@ -62,6 +62,12 @@ class VelvetGE extends RenderingEngine
         return $this->edges;
     }
 
+    /** A ring is repaired before each frame is drawn, so its back holds the last frame too. */
+    protected function keepsFrame(Framebuffer $framebuffer): bool
+    {
+        return $framebuffer instanceof RingFramebuffer || parent::keepsFrame($framebuffer);
+    }
+
     protected function execute(array $commands): void
     {
         $target = $this->framebuffer;
@@ -75,7 +81,13 @@ class VelvetGE extends RenderingEngine
 
         foreach ($commands as $command) {
             if ($command[0] === 'clear') {
-                $target->fill($this->mapper->fromRgba8($command[1] >> 24, ($command[1] >> 16) & 0xFF, ($command[1] >> 8) & 0xFF, $command[1] & 0xFF));
+                $word = $this->mapper->fromRgba8($command[1] >> 24, ($command[1] >> 16) & 0xFF, ($command[1] >> 8) & 0xFF, $command[1] & 0xFF);
+                $area = isset($command[2]) ? $command[2]->intersect($rows) : null;
+                match (true) {
+                    ! isset($command[2]) => $target->fill($word),
+                    ! is_null($area) => $target->setSegment($area->x, $area->y, $area->width, $area->height, $word),
+                    default => null,
+                };
 
                 continue;
             }
@@ -88,6 +100,11 @@ class VelvetGE extends RenderingEngine
 
             $clip = $command[array_key_last($command)]->intersect($rows);
             if (is_null($clip)) {
+                continue;
+            }
+            if ($command[0] === 'spans') {
+                $target->paintSpans($command[1], $command[2]);
+
                 continue;
             }
             $raster = $this->rasterizers["{$clip->x},{$clip->y},{$clip->width},{$clip->height}"] ??= $this->rasterize->rasterizer($clip, $this->edges);
