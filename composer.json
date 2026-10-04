@@ -1,7 +1,19 @@
 {
     "name": "venusian-surface/drawing",
-    "description": "Surface drawing: engine-free drawing contracts, the Painter and GPU regions over gpu.<engine>, the Rasterizer and five CPU engines over cpu.<engine>.",
+    "description": "Surface drawing: one rendering-engine API over CPU and GPU, the DrawingManager that builds engines, and VelvetGE, the software engine over Rasterize and a framebuffer.",
+    "keywords": [
+        "venusian",
+        "surface",
+        "drawing",
+        "rendering",
+        "software-renderer"
+    ],
     "license": "MIT",
+    "homepage": "https://venusian.projectsaturnstudios.com/ecosystem/venusian/surface/0.10.x/drawing",
+    "support": {
+        "issues": "https://github.com/VenusianPHP/surface/issues",
+        "source": "https://github.com/venusian-surface/drawing"
+    },
     "authors": [
         {
             "name": "Angel Gonzalez",
@@ -10,19 +22,21 @@
     ],
     "require": {
         "php": "^8.4|^8.5|^8.6",
-        "venusian-surface/contracts": "^0.8.0",
-        "venusian-surface/framebuffers": "^0.8.0",
-        "venusian-voyager/contracts": "^0.8.0",
-        "venusian-voyager/magic-aliases": "^0.8.0",
-        "venusian-voyager/nuts-and-bolts": "^0.8.0"
+        "venusian-surface/contracts": "^0.10.0",
+        "venusian-surface/framebuffers": "^0.10.0",
+        "venusian-surface/nuts-and-bolts": "^0.10.0",
+        "venusian-surface/rasterize": "^0.10.0",
+        "venusian-voyager/contracts": "^0.10.1",
+        "venusian-voyager/nuts-and-bolts": "^0.10.1"
     },
     "suggest": {
-        "jovian/venusian-sdl3": "^0.8.0 - The sdl3 stage host (engine-owned SDL windows) and the sdl3 GPU engine (SDL_GPU).",
-        "jovian/venusian-metal": "^0.8.0 - The metal GPU engine (macOS).",
-        "jovian/venusian-ogx": "^0.8.0 - The opengl GPU engine.",
-        "jovian/venusian-vulkan": "^0.8.0 - The vulkan GPU engine (MoltenVK on macOS, a lent VkSurfaceKHR elsewhere)."
+        "jovian/venusian-metal": "The 'metal' rendering engine (macOS).",
+        "jovian/venusian-opengl": "The 'opengl' rendering engine.",
+        "jovian/venusian-sdl3": "The 'sdl3' rendering engine (SDL_GPU).",
+        "jovian/venusian-vulkan": "The 'vulkan' rendering engine (MoltenVK on macOS)."
     },
     "minimum-stability": "dev",
+    "prefer-stable": true,
     "autoload": {
         "psr-4": {
             "Surface\\Drawing\\": ""
@@ -33,16 +47,12 @@
     },
     "extra": {
         "branch-alias": {
-            "dev-main": "0.8.x-dev"
+            "dev-main": "0.10.x-dev"
         },
         "venusian": {
             "providers": [
                 "Surface\\Drawing\\DrawingServiceProvider"
-            ],
-            "aliases": {
-                "GPU": "Surface\\Drawing\\MagicAliases\\GPU",
-                "CPU": "Surface\\Drawing\\MagicAliases\\CPU"
-            }
+            ]
         }
     }
 }
