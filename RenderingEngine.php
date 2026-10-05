@@ -9,6 +9,7 @@ use Surface\Contracts\Framebuffers\Filter;
 use Surface\Contracts\Framebuffers\Framebuffer;
 use Surface\Contracts\Framebuffers\PagedFramebuffer;
 use Surface\Contracts\Framebuffers\Region;
+use Surface\Contracts\Framebuffers\RingFramebuffer;
 use Surface\Contracts\Rasterize\FillRule;
 use Surface\Drawing\Text\PlacedGlyph;
 use Surface\Drawing\Text\Typesetter;
@@ -454,13 +455,13 @@ abstract class RenderingEngine implements RenderingEngineContract
 
     /**
      * Whether the framebuffer still holds the last frame when the next is
-     * drawn, so drawing only what changed leaves the rest correct. An engine
-     * that brings a framebuffer up to date itself before drawing (a ring it
-     * repairs) answers true for it.
+     * drawn, so drawing only what changed leaves the rest correct. Every
+     * engine repairs a ring before drawing, so its back holds the last frame
+     * too: a ring keeps its frame whatever the engine.
      */
     protected function keepsFrame(Framebuffer $framebuffer): bool
     {
-        return $framebuffer->preservesContentsOnPresent();
+        return $framebuffer->preservesContentsOnPresent() || $framebuffer instanceof RingFramebuffer;
     }
 
     /**

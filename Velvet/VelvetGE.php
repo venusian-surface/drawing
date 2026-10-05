@@ -62,12 +62,6 @@ class VelvetGE extends RenderingEngine
         return $this->edges;
     }
 
-    /** A ring is repaired before each frame is drawn, so its back holds the last frame too. */
-    protected function keepsFrame(Framebuffer $framebuffer): bool
-    {
-        return $framebuffer instanceof RingFramebuffer || parent::keepsFrame($framebuffer);
-    }
-
     protected function execute(array $commands): void
     {
         $target = $this->framebuffer;

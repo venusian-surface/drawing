@@ -4,6 +4,7 @@ namespace Surface\Drawing;
 
 use Closure;
 use Surface\Contracts\Drawing\DrawingException;
+use Surface\Contracts\Drawing\OutputTarget;
 use Surface\Contracts\Drawing\RenderingEngine;
 use Surface\Contracts\Framebuffers\FormatSpec;
 use Surface\Contracts\Framebuffers\Framebuffer;
@@ -18,9 +19,11 @@ use Surface\Rasterize\RasterizeManager;
  *
  *     app('drawing')->renderer('velvet', ['framebuffer' => $fb]);
  *     app('drawing')->renderer('velvet', ['width' => 320, 'height' => 240, 'mode' => 'ring', 'frames' => 3]);
+ *     app('drawing')->renderer('velvet', ['output' => $canvas]);
  *
- * 'velvet', the software engine, is built in. A package that brings another
- * engine registers it with extend(); its arguments are its own.
+ * 'output' draws over the target's own framebuffer: what a canvas or a display
+ * would show. 'velvet', the software engine, is built in. A package that
+ * brings another engine registers it with extend(); its arguments are its own.
  */
 class DrawingManager
 {
@@ -32,7 +35,7 @@ class DrawingManager
         'sdl3' => 'jovian/venusian-sdl3',
     ];
 
-    protected const array VELVET_ARGUMENTS = ['framebuffer', 'width', 'height', 'mode', 'format', 'page_rows', 'frames', 'framebuffers', 'rasterize', 'edges'];
+    protected const array VELVET_ARGUMENTS = ['output', 'framebuffer', 'width', 'height', 'mode', 'format', 'page_rows', 'frames', 'framebuffers', 'rasterize', 'edges'];
 
     /** @var array<string, Closure(array<string, mixed>, self): RenderingEngine> */
     protected array $creators = [];
@@ -92,11 +95,12 @@ class DrawingManager
     }
 
     /**
-     * VelvetGE over a framebuffer handed in ('framebuffer'), or over one made
-     * here: 'width' and 'height', 'mode' (full, dirty, epaper, paged with
-     * 'page_rows', ring with 'frames'), 'format' (RGBA8 unless given) and
-     * 'framebuffers' (the driver; config's unless given). 'rasterize' names the
-     * rasterize driver, 'edges' the edge mode; both have defaults.
+     * VelvetGE over a framebuffer handed in ('framebuffer'), over an output
+     * target's own framebuffer ('output'), or over one made here: 'width' and
+     * 'height', 'mode' (full, dirty, epaper, paged with 'page_rows', ring
+     * with 'frames'), 'format' (RGBA8 unless given) and 'framebuffers' (the
+     * driver; config's unless given). 'rasterize' names the rasterize driver,
+     * 'edges' the edge mode; both have defaults.
      *
      * @param  array<string, mixed>  $args
      */
@@ -122,6 +126,19 @@ class DrawingManager
     /** @param array<string, mixed> $args */
     private function velvetFramebuffer(array $args): Framebuffer
     {
+        if (array_key_exists('output', $args)) {
+            if (! $args['output'] instanceof OutputTarget) {
+                throw new DrawingException("'output' is an OutputTarget: a canvas or a display.");
+            }
+            foreach (['framebuffer', 'width', 'height', 'mode', 'format', 'page_rows', 'frames', 'framebuffers'] as $key) {
+                if (array_key_exists($key, $args)) {
+                    throw new DrawingException("'output' comes alone: '{$key}' describes a framebuffer to be made.");
+                }
+            }
+
+            return $args['output']->framebuffer();
+        }
+
         if (array_key_exists('framebuffer', $args)) {
             if (! $args['framebuffer'] instanceof Framebuffer) {
                 throw new DrawingException("'framebuffer' is a Framebuffer.");
