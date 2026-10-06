@@ -23,7 +23,7 @@ use Surface\Rasterize\RasterizeManager;
  *
  * 'output' draws over the target's own framebuffer: what a canvas or a display
  * would show. 'velvet', the software engine, is built in. A package that
- * brings another engine registers it with extend(); its arguments are its own.
+ * brings another engine registers it with extend(); a GPU engine's creator is GpuRenderingEngine::from($device, $args, $manager).
  */
 class DrawingManager
 {
@@ -112,6 +112,19 @@ class DrawingManager
             }
         }
 
+        return new VelvetGE($this->framebufferFrom($args), $this->rasterize->driver($args['rasterize'] ?? null), $this->edgesFrom($args));
+    }
+
+    /**
+     * 'edges' as an engine takes it: an Edges, 'hard' or 'antialiased'. Null
+     * when it is not given: the engine picks.
+     *
+     * @param  array<string, mixed>  $args
+     *
+     * @throws DrawingException When 'edges' is anything else.
+     */
+    public function edgesFrom(array $args): ?Edges
+    {
         $edges = $args['edges'] ?? null;
         if (is_string($edges)) {
             $edges = Edges::tryFrom($edges) ?? throw new DrawingException("'edges' is 'hard' or 'antialiased', got '{$edges}'.");
@@ -120,11 +133,22 @@ class DrawingManager
             throw new DrawingException("'edges' is 'hard' or 'antialiased', or an Edges.");
         }
 
-        return new VelvetGE($this->velvetFramebuffer($args), $this->rasterize->driver($args['rasterize'] ?? null), $edges);
+        return $edges;
     }
 
-    /** @param array<string, mixed> $args */
-    private function velvetFramebuffer(array $args): Framebuffer
+    /**
+     * The framebuffer an engine that draws on the CPU is given: an output's
+     * own ('output'), one handed in ('framebuffer'), or one made here from
+     * 'width', 'height', 'mode', 'format', 'page_rows', 'frames' and
+     * 'framebuffers'. A GPU engine has its own and reads none of these but
+     * 'output', 'width' and 'height' (GpuRenderingEngine::from()).
+     *
+     * @param  array<string, mixed>  $args
+     * @param  string  $engine  The engine's name, for the messages.
+     *
+     * @throws DrawingException When the arguments do not describe one framebuffer.
+     */
+    public function framebufferFrom(array $args, string $engine = 'velvet'): Framebuffer
     {
         if (array_key_exists('output', $args)) {
             if (! $args['output'] instanceof OutputTarget) {
@@ -153,7 +177,7 @@ class DrawingManager
         }
 
         if (! isset($args['width'], $args['height'])) {
-            throw new DrawingException("velvet needs a 'framebuffer', or a 'width' and a 'height' to make one.");
+            throw new DrawingException("{$engine} needs a 'framebuffer', or a 'width' and a 'height' to make one.");
         }
         if (! is_int($args['width']) || ! is_int($args['height'])) {
             throw new DrawingException("'width' and 'height' are integers.");
