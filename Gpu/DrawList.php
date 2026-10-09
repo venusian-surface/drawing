@@ -17,7 +17,8 @@ namespace Surface\Drawing\Gpu;
  *     [Op::COVER, first, rgba]                              a quad, drawn where the stencil is non-zero, resetting it to zero
  *     [Op::ELLIPSE, first, cx, cy, rx, ry, rgba]            a quad; coverage is the ellipse's, computed per pixel
  *     [Op::RING, first, cx, cy, rx, ry, stroke, rgba]       a quad; coverage is the band's between radii r ± stroke / 2
- *     [Op::UPLOAD, texture, Framebuffer]                    make the source texture number `texture`, from its toRgba8()
+ *     [Op::UPLOAD, texture, Framebuffer]                    make the source texture number `texture`, from its toRgba8(); an
+ *                                                           HdrImage's from its rgba16f() on a target in an HDR colour space
  *     [Op::IMAGE, first, texture, Affine, opacity, Filter]  a quad over the placed corners; the Affine maps a target pixel's
  *                                                           centre to source pixels, sampled as paintImage() samples;
  *                                                           opacity 1..255

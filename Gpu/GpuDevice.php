@@ -44,7 +44,14 @@ interface GpuDevice
     /** The surface this device will present into. Called once, before target(): a GL device makes the lent context current here. */
     public function adopt(LentSurface $surface): void;
 
-    /** Copy the target into the lent surface on the GPU. False when no drawable was free and nothing was copied. */
+    /**
+     * Copy the target into the lent surface on the GPU, into
+     * $surface->presentRect() with the surface's scaling filter, clearing the
+     * rest. What changed since the last present that landed is the target's
+     * damage(); a DamageHistory turns it into surface rects per swapchain
+     * image. False when no drawable was free and nothing was copied: the
+     * damage stays for the next present.
+     */
     public function present(LentSurface $surface): bool;
 
     /** Let go of the target and the device. */
