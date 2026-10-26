@@ -61,6 +61,9 @@ abstract class RenderingEngine implements RenderingEngineContract
     /** @var list<Region> Where the last ended frame changed the framebuffer. */
     private array $damage = [];
 
+    /** @var list<Region> scrolled since the last end(): the framebuffer no longer holds the last frame there */
+    private array $scrolled = [];
+
     /**
      * Carry out one frame.
      *
@@ -100,6 +103,9 @@ abstract class RenderingEngine implements RenderingEngineContract
         $this->whole = false;
         $this->close();
 
+        $scrolled = $this->scrolled;
+        $this->scrolled = [];
+
         $framebuffer = $this->framebuffer();
         if (is_null($before) || $framebuffer instanceof PagedFramebuffer) {
             $this->damage = [$this->surface()];
@@ -112,15 +118,38 @@ abstract class RenderingEngine implements RenderingEngineContract
         // repaints the pixels already there. One that does not draws over
         // them: all of it is drawn.
         if (($commands[0][0] ?? null) !== 'clear' || isset($commands[0][2])) {
-            $this->damage = $this->merge(array_values(array_filter(array_map($this->box(...), $commands))));
+            $this->damage = $this->merge([...array_values(array_filter(array_map($this->box(...), $commands))), ...$scrolled]);
             $this->execute($commands);
 
             return $this;
         }
 
-        $this->damage = $this->changed($before, $commands);
+        // A scrolled region no longer holds what the last frame drew there: it is drawn again.
+        $this->damage = $this->merge([...$this->changed($before, $commands), ...$scrolled]);
         if ($this->damage !== []) {
             $this->execute($this->keepsFrame($framebuffer) ? $this->scissor($commands, $this->damage) : $commands);
+        }
+
+        return $this;
+    }
+
+    public function canScroll(): bool
+    {
+        return $this->keepsFrame($this->framebuffer());
+    }
+
+    public function scroll(Region $region, int $dx, int $dy): static
+    {
+        if ($this->drawing()) {
+            throw new DrawingException('A frame is open: scroll() runs between frames.');
+        }
+        if (! $this->canScroll()) {
+            throw new DrawingException('This framebuffer does not keep its frame: it cannot scroll.');
+        }
+        $this->framebuffer()->scroll($region, $dx, $dy);
+        $clip = $region->intersect($this->surface());
+        if (! is_null($clip) && ($dx !== 0 || $dy !== 0)) {
+            $this->scrolled[] = $clip;
         }
 
         return $this;

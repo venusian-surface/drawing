@@ -65,7 +65,8 @@ class VelvetGE extends RenderingEngine
     protected function execute(array $commands): void
     {
         $target = $this->framebuffer;
-        if ($target instanceof RingFramebuffer) {
+        // A back a scroll already repaired holds the last frame: age() 1.
+        if ($target instanceof RingFramebuffer && $target->age() !== 1) {
             $target->repair();
         }
 
