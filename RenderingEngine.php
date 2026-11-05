@@ -15,6 +15,8 @@ use Surface\Drawing\Text\PlacedGlyph;
 use Surface\Drawing\Text\Typesetter;
 use Surface\NutsAndBolts\Affine;
 use Surface\NutsAndBolts\Color;
+use Surface\NutsAndBolts\LinearGradient;
+use Surface\Contracts\Text\ShapedRun;
 use Throwable;
 
 /**
@@ -52,6 +54,9 @@ abstract class RenderingEngine implements RenderingEngineContract
 
     /** @var list<array{Affine, Region}> */
     private array $stack = [];
+
+    /** @var list<Region> The clips pushClip() put aside, innermost last. */
+    private array $clips = [];
 
     private ?Typesetter $typesetter = null;
 
@@ -262,6 +267,26 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $this;
     }
 
+    public function pushClip(Region $region): static
+    {
+        $this->open('pushClip');
+        $this->clips[] = $this->clip;
+        $this->clip = $region->intersect($this->clip) ?? new Region(0, 0, 0, 0);
+
+        return $this;
+    }
+
+    public function popClip(): static
+    {
+        $this->open('popClip');
+        if ($this->clips === []) {
+            throw new DrawingException('popClip() without a pushClip().');
+        }
+        $this->clip = array_pop($this->clips);
+
+        return $this;
+    }
+
     public function clipRegion(): Region
     {
         return $this->clip ?? $this->surface();
@@ -381,6 +406,102 @@ abstract class RenderingEngine implements RenderingEngineContract
         $stroke = $this->strokeWidth($stroke);
         if ($radius_x > 0 && $radius_y > 0 && $stroke > 0 && ! $this->clip->isEmpty()) {
             $this->recording[] = ['ring', $x, $y, $radius_x, $radius_y, $stroke, self::rgba($color), $this->clip];
+        }
+
+        return $this;
+    }
+
+    /** The path fallback fills a gradient with its from colour; an engine that draws it exactly overrides this. */
+    public function roundRect(float $x, float $y, float $width, float $height, array $radii, Color $fill, ?Color $border = null, float $borderWidth = 0.0, ?LinearGradient $gradient = null): static
+    {
+        $this->open('roundRect');
+        $fill = $gradient?->from ?? $fill;
+        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'borderWidth' => $borderWidth]);
+        if ($width <= 0 || $height <= 0) {
+            return $this;
+        }
+        $radii = self::radii($radii, $width, $height);
+        $outer = $this->rounded($x, $y, $width, $height, $radii);
+        $inset = is_null($border) ? 0.0 : min(max(0.0, $borderWidth), min($width, $height) / 2);
+        if ($inset <= 0) {
+            return $this->path([$outer], FillRule::NON_ZERO, $fill);
+        }
+        if ($inset * 2 >= min($width, $height)) {
+            return $this->path([$outer], FillRule::NON_ZERO, $border);
+        }
+        $inner = $this->rounded($x + $inset, $y + $inset, $width - 2 * $inset, $height - 2 * $inset, array_map(fn (float $r) => max(0.0, $r - $inset), $radii));
+
+        return $this->path([$inner], FillRule::NON_ZERO, $fill)->path([$outer, $inner], FillRule::EVEN_ODD, $border);
+    }
+
+    public function shadow(float $x, float $y, float $width, float $height, float $radius, float $blur, Color $color): static
+    {
+        $this->open('shadow');
+        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'radius' => $radius, 'blur' => $blur]);
+        if ($width <= 0 || $height <= 0) {
+            return $this;
+        }
+        $blur = max(0.0, $blur);
+        $y += $blur * 0.25; // shadows sit a little low, by convention (Raven)
+        if ($blur == 0.0) {
+            return $this->path([$this->rounded($x, $y, $width, $height, self::radii(array_fill(0, 4, $radius), $width, $height))], FillRule::NON_ZERO, $color);
+        }
+        // shortcut: 4 stacked translucent layers approximate the blur; VelvetGE draws it exactly.
+        $layer = new Color($color->red, $color->green, $color->blue, $color->alpha / 4);
+        for ($k = 3; $k >= 0; $k--) {
+            $grow = $blur * $k / 3;
+            $w = $width + 2 * $grow;
+            $h = $height + 2 * $grow;
+            $this->path([$this->rounded($x - $grow, $y - $grow, $w, $h, self::radii(array_fill(0, 4, $radius + $grow), $w, $h))], FillRule::NON_ZERO, $layer);
+        }
+
+        return $this;
+    }
+
+    /**
+     * The fallback every engine has: the mask in 16 alpha levels, one full-coverage span command per level present.
+     * An engine that blends per pixel overrides this.
+     */
+    public function coverage(string $mask, int $width, int $height, float $x, float $y, Color $color): static
+    {
+        $this->open('coverage');
+        $place = $this->maskPlace($mask, $width, $height, $x, $y);
+        if (is_null($place)) {
+            return $this;
+        }
+        /** @var array<int, string> $levels spans per level 1..15 */
+        $levels = [];
+        $this->maskRuns($mask, $width, $place, fn (int $byte): int => (int) round($byte * 15 / 255), function (int $level, string $span) use (&$levels): void {
+            $levels[$level] = ($levels[$level] ?? '').$span;
+        });
+        ksort($levels);
+        foreach ($levels as $level => $spans) {
+            $this->spans($spans, new Color($color->red, $color->green, $color->blue, $color->alpha * $level / 15));
+        }
+
+        return $this;
+    }
+
+    /**
+     * A shaped run with its baseline at y: one coverage() per glyph that has ink and is not clipped away, its mask's
+     * top-left on whole pixels. The run is in device pixels, so the masks are drawn at their own size.
+     */
+    public function glyphs(ShapedRun $run, float $x, float $y, Color $color): static
+    {
+        $this->open('glyphs');
+        self::finite(['x' => $x, 'y' => $y]);
+        foreach ($run->glyphs() as $glyph) {
+            $mask = $glyph->mask();
+            if ($mask->isEmpty()) {
+                continue;
+            }
+            $left = round($x + $glyph->x) + $mask->left;
+            $top = round($y + $glyph->y) - $mask->top;
+            [$dx, $dy] = $this->matrix->apply($left, $top);
+            if (is_null((new Region((int) round($dx), (int) round($dy), $mask->width, $mask->height))->intersect($this->clip))) {
+                continue;
+            }
+            $this->coverage($mask->coverage, $mask->width, $mask->height, $left, $top, $color);
         }
 
         return $this;
@@ -746,6 +867,21 @@ abstract class RenderingEngine implements RenderingEngineContract
         $this->matrix = null;
         $this->clip = null;
         $this->stack = [];
+        $this->clips = [];
+    }
+
+    /**
+     * Record spans an engine worked out itself, in framebuffer pixels: 7 bytes each (y, x, length as uint16 LE, coverage),
+     * rows top to bottom, already inside clipRegion().
+     */
+    protected function spans(string $spans, Color $color): static
+    {
+        $this->open('spans');
+        if ($spans !== '' && ! $this->clip->isEmpty()) {
+            $this->recording[] = ['spans', $spans, self::rgba($color), $this->clip];
+        }
+
+        return $this;
     }
 
     /** @param list<list<array{float, float}>> $contours Already transformed. */
@@ -859,8 +995,117 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $points;
     }
 
+    /**
+     * Where a mask lands: its origin through the transform, rounded to whole pixels, and the part of it inside the
+     * clip; null when none is.
+     *
+     * @return array{int, int, Region}|null left, top, the visible part in framebuffer pixels
+     *
+     * @throws DrawingException When the mask is not width*height bytes.
+     */
+    protected function maskPlace(string $mask, int $width, int $height, float $x, float $y): ?array
+    {
+        self::finite(['x' => $x, 'y' => $y]);
+        if ($width < 0 || $height < 0 || strlen($mask) !== $width * $height) {
+            throw new DrawingException("A coverage mask of {$width}x{$height} needs ".max(0, $width * $height).' bytes, not '.strlen($mask).'.');
+        }
+        if ($width === 0 || $height === 0) {
+            return null;
+        }
+        [$tx, $ty] = $this->point($x, $y);
+        $left = (int) round($tx);
+        $top = (int) round($ty);
+        $visible = (new Region($left, $top, $width, $height))->intersect($this->clip);
+
+        return is_null($visible) || $visible->isEmpty() ? null : [$left, $top, $visible];
+    }
+
+    /**
+     * Runs of equal level along each visible row of a placed mask, top to bottom, as 7-byte spans of coverage 255;
+     * level 0 is skipped.
+     *
+     * @param  array{int, int, Region}  $place
+     * @param  callable(int): int  $level  byte to level
+     * @param  callable(int, string): void  $emit  level, span
+     */
+    protected function maskRuns(string $mask, int $width, array $place, callable $level, callable $emit, bool $byteCoverage = false): void
+    {
+        [$left, $top, $visible] = $place;
+        for ($y = $visible->y; $y < $visible->y + $visible->height; $y++) {
+            $row = ($y - $top) * $width - $left;
+            $run_x = $visible->x;
+            $run = -1;
+            for ($x = $visible->x; $x <= $visible->x + $visible->width; $x++) {
+                $here = $x < $visible->x + $visible->width ? $level(ord($mask[$row + $x])) : -1;
+                if ($here !== $run) {
+                    if ($run > 0) {
+                        $emit($run, pack('vvvC', $y, $run_x, $x - $run_x, $byteCoverage ? $run : 255));
+                    }
+                    [$run_x, $run] = [$x, $here];
+                }
+            }
+        }
+    }
+
+    /**
+     * Per-corner radii [tl, tr, br, bl], each held to 0 .. half the short side.
+     *
+     * @return list<float>
+     */
+    protected static function radii(array $radii, float $width, float $height): array
+    {
+        $radii = array_values($radii);
+        if (count($radii) !== 4) {
+            throw new DrawingException('Radii must be 4 numbers: top-left, top-right, bottom-right, bottom-left.');
+        }
+        $limit = min($width, $height) / 2;
+
+        return array_map(function (mixed $r) use ($limit): float {
+            if (! is_int($r) && ! is_float($r)) {
+                throw new DrawingException('Radii must be 4 numbers: top-left, top-right, bottom-right, bottom-left.');
+            }
+            self::finite(['radius' => (float) $r]);
+
+            return min(max(0.0, (float) $r), $limit);
+        }, $radii);
+    }
+
+    /**
+     * A rounded rect as one contour through the transform, clockwise from the top-left arc. Each quarter arc gets
+     * enough sides to stay within FLATNESS of the circle at the size the transform draws it.
+     *
+     * @param  list<float>  $radii  [tl, tr, br, bl], already held
+     * @return list<array{float, float}>
+     */
+    private function rounded(float $x, float $y, float $width, float $height, array $radii): array
+    {
+        $grow = sqrt(abs($this->matrix->determinant()));
+        $centres = [
+            [$x + $radii[0], $y + $radii[0], M_PI],
+            [$x + $width - $radii[1], $y + $radii[1], 1.5 * M_PI],
+            [$x + $width - $radii[2], $y + $height - $radii[2], 0.0],
+            [$x + $radii[3], $y + $height - $radii[3], 0.5 * M_PI],
+        ];
+        $points = [];
+        foreach ($centres as $corner => [$cx, $cy, $start]) {
+            $r = $radii[$corner];
+            if ($r <= 0) {
+                $points[] = $this->point($cx, $cy);
+
+                continue;
+            }
+            $sides = (int) max(1, min(256, ceil(M_PI / 2 * sqrt($r * $grow / (2 * self::FLATNESS)))));
+            for ($i = 0; $i <= $sides; $i++) {
+                $angle = $start + (M_PI / 2) * $i / $sides;
+                $points[] = $this->point($cx + $r * cos($angle), $cy + $r * sin($angle));
+            }
+        }
+
+        return $points;
+    }
+
     /** @param array<string, float> $numbers */
-    private static function finite(array $numbers): void
+    protected static function finite(array $numbers): void
     {
         foreach ($numbers as $name => $value) {
             if (! is_finite($value)) {
