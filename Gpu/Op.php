@@ -15,4 +15,10 @@ enum Op
     case UPLOAD;
     case IMAGE;
     case RECTS;
+    case ATLAS;
+    case MASK;
+    case GLYPHS;
+    case ROUNDRECT;
+    case ROUNDRING;
+    case SHADOW;
 }

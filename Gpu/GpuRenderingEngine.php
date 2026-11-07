@@ -50,6 +50,9 @@ class GpuRenderingEngine extends RenderingEngine implements SurfaceBorrower
 
     protected Edges $edges;
 
+    /** TrueType glyph masks, kept on the device across frames. */
+    private ?GlyphAtlas $atlas = null;
+
     protected ?LentSurface $surface = null;
 
     protected ?VSync $vsync = null;
@@ -323,11 +326,12 @@ class GpuRenderingEngine extends RenderingEngine implements SurfaceBorrower
             $this->output->reclaim();
         }
         $this->device->release();
+        $this->atlas?->forget();
     }
 
     protected function execute(array $commands): void
     {
-        $this->device->draw(Lowering::lower($commands, $this->width(), $this->height()));
+        $this->device->draw(Lowering::lower($commands, $this->width(), $this->height(), $this->atlas ??= new GlyphAtlas($this->edges)));
         $this->framebuffer->drawn($this->damage());
     }
 

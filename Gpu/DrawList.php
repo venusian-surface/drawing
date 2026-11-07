@@ -23,6 +23,23 @@ namespace Surface\Drawing\Gpu;
  *                                                           centre to source pixels, sampled as paintImage() samples;
  *                                                           opacity 1..255
  *     [Op::RECTS, first, count, rgba]                       count / 6 quads, one per span of whole pixels
+ *     [Op::ATLAS, atlas, width, height]                     make texture number `atlas`, single-channel 8-bit, all zero; it is
+ *                                                           kept across frames until the next ATLAS for that number or release();
+ *                                                           remaking it lets go of the old texture once no frame in flight reads it
+ *     [Op::MASK, atlas, Region, bytes]                      write Region->width * Region->height coverage bytes, rows top-down,
+ *                                                           into that region of the atlas
+ *     [Op::GLYPHS, first, count, texels, atlas, rgba]       count vertices of quads at first; the atlas texel coordinates of the
+ *                                                           same vertices are float pairs from vertex `texels`. Coverage is sampled
+ *                                                           nearest at the texel and blended as paintSpans() blends that coverage
+ *     [Op::ROUNDRECT, first, x0, y0, x1, y1, radii, rgba]   a quad 1 px past the box; coverage per sample is inside the box with
+ *                                                           corner radii [tl, tr, br, bl]
+ *     [Op::ROUNDRING, first, x0, y0, x1, y1, radii, inset, rgba]
+ *                                                           the same quad; coverage per sample is inside the box and outside the
+ *                                                           box inset by `inset`, whose radii are max(0, r − inset)
+ *     [Op::SHADOW, first, x0, y0, x1, y1, radius, blur, rgba]
+ *                                                           a quad blur + 1 past the box; coverage per pixel centre is
+ *                                                           1 − smoothstep(−blur, blur, d), d the signed distance to the rounded box;
+ *                                                           hard edges keep coverage of 128 and up, at 255
  */
 final readonly class DrawList
 {

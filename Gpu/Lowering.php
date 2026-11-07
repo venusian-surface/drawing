@@ -2,6 +2,7 @@
 
 namespace Surface\Drawing\Gpu;
 
+use Surface\Contracts\Drawing\DrawingException;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Framebuffers\Spans;
 use Surface\Contracts\Rasterize\FillRule;
@@ -28,14 +29,19 @@ final class Lowering
     /** @var array<int, int> Texture number by the source's object id. */
     private array $textures = [];
 
-    private function __construct() {}
+    private function __construct(private readonly ?GlyphAtlas $atlas) {}
 
     /**
+     * A first pass places every glyph mask of the frame, so all ATLAS and MASK operations come before any draw.
+     *
      * @param  list<array<int, mixed>>  $commands
+     *
+     * @throws DrawingException When a frame has glyphs and no atlas is given, or its masks do not fit one.
      */
-    public static function lower(array $commands, int $width, int $height): DrawList
+    public static function lower(array $commands, int $width, int $height, ?GlyphAtlas $atlas = null): DrawList
     {
-        $lowering = new self;
+        $lowering = new self($atlas);
+        $lowering->placeGlyphs($commands);
         foreach ($commands as $command) {
             $lowering->command($command);
         }
@@ -104,6 +110,43 @@ final class Lowering
 
                 return;
 
+            case 'glyphs':
+                [, $font, $pixelSize, $glyphs, $rgba, , $clip] = $command;
+                $quads = [];
+                $texels = [];
+                foreach ($glyphs as [$face, $glyph, $left, $top, $style]) {
+                    $at = $this->atlas->where(GlyphAtlas::key($face, $pixelSize, $glyph, $style));
+                    array_push($quads, ...self::corners($left, $top, $left + $at->width, $top + $at->height));
+                    array_push($texels, ...self::corners($at->x, $at->y, $at->right(), $at->bottom()));
+                }
+                $this->clip($clip);
+                $first = $this->push($quads);
+                $this->operations[] = [Op::GLYPHS, $first, intdiv(count($quads), 2), $this->push($texels), GlyphAtlas::TEXTURE, $rgba];
+
+                return;
+
+            case 'roundrect':
+                [, $x0, $y0, $x1, $y1, $radii, $rgba, $clip] = $command;
+                $this->clip($clip);
+                $this->operations[] = [Op::ROUNDRECT, $this->quad($x0 - 1.0, $y0 - 1.0, $x1 + 1.0, $y1 + 1.0), $x0, $y0, $x1, $y1, $radii, $rgba];
+
+                return;
+
+            case 'roundring':
+                [, $x0, $y0, $x1, $y1, $radii, $inset, $rgba, $clip] = $command;
+                $this->clip($clip);
+                $this->operations[] = [Op::ROUNDRING, $this->quad($x0 - 1.0, $y0 - 1.0, $x1 + 1.0, $y1 + 1.0), $x0, $y0, $x1, $y1, $radii, $inset, $rgba];
+
+                return;
+
+            case 'shadow':
+                [, $x0, $y0, $x1, $y1, $radius, $blur, $rgba, $clip] = $command;
+                $reach = $blur + 1.0;
+                $this->clip($clip);
+                $this->operations[] = [Op::SHADOW, $this->quad($x0 - $reach, $y0 - $reach, $x1 + $reach, $y1 + $reach), $x0, $y0, $x1, $y1, $radius, $blur, $rgba];
+
+                return;
+
             case 'spans':
                 [, $spans, $rgba, $clip] = $command;
                 $floats = [];
@@ -144,6 +187,34 @@ final class Lowering
         $this->operations[] = [Op::COVER, $this->quad(floor(min($xs)), floor(min($ys)), ceil(max($xs)), ceil(max($ys))), $rgba];
     }
 
+    /** @param list<array<int, mixed>> $commands */
+    private function placeGlyphs(array $commands): void
+    {
+        $wanted = [];
+        foreach ($commands as $command) {
+            if ($command[0] !== 'glyphs') {
+                continue;
+            }
+            [, $font, $pixelSize, $glyphs] = $command;
+            foreach ($glyphs as [$face, $glyph, , , $style]) {
+                $wanted[] = [GlyphAtlas::key($face, $pixelSize, $glyph, $style), $font->mask($face, $pixelSize, $glyph, $style)];
+            }
+        }
+        if ($wanted === []) {
+            return;
+        }
+        if (is_null($this->atlas)) {
+            throw DrawingException::noAtlas();
+        }
+        $this->atlas->prepare($wanted, $this->operations);
+    }
+
+    /** @return list<float> The six vertices of a quad. */
+    private static function corners(float $x0, float $y0, float $x1, float $y1): array
+    {
+        return [$x0, $y0, $x1, $y0, $x1, $y1, $x0, $y0, $x1, $y1, $x0, $y1];
+    }
+
     private function clip(Region $region): void
     {
         if ($this->scissor != $region) {
@@ -155,7 +226,7 @@ final class Lowering
     /** @return int The quad's first vertex. */
     private function quad(float $x0, float $y0, float $x1, float $y1): int
     {
-        return $this->push([$x0, $y0, $x1, $y0, $x1, $y1, $x0, $y0, $x1, $y1, $x0, $y1]);
+        return $this->push(self::corners($x0, $y0, $x1, $y1));
     }
 
     /**
