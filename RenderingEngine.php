@@ -4,6 +4,7 @@ namespace Surface\Drawing;
 
 use Surface\Contracts\Drawing\DrawingException;
 use Surface\Contracts\Drawing\RenderingEngine as RenderingEngineContract;
+use Surface\Contracts\Drawing\StrokeStyle;
 use Surface\Contracts\Fonts\Font;
 use Surface\Contracts\Fonts\GFXFont;
 use Surface\Contracts\Fonts\ShapedGlyph;
@@ -18,6 +19,9 @@ use Surface\Drawing\Text\PlacedGlyph;
 use Surface\Drawing\Text\Typesetter;
 use Surface\NutsAndBolts\Affine;
 use Surface\NutsAndBolts\Color;
+use Surface\NutsAndBolts\Gradient;
+use Surface\NutsAndBolts\Path;
+use Surface\Rasterize\Stroker;
 use Throwable;
 
 /**
@@ -32,14 +36,18 @@ use Throwable;
  *     ['clear', rgba]                                     the whole surface
  *     ['clear', rgba, Region]                             only that region (a partial frame)
  *     ['path', contours, FillRule, rgba, clip]            contours: list of lists of [x, y]
+ *     ['gradpath', contours, FillRule, gradient, clip]     a path filled with a gradient: ['kind' => 'linear'|'radial', 'inverse' => Affine (a surface point to the gradient's own
+ *                                                         space), 'spread' => GradientSpread, 'ramp' => 256 RGBA colours]
  *     ['polyline', points, stroke, closed, rgba, clip]
  *     ['ellipse', cx, cy, rx, ry, rgba, clip]             axis-aligned
  *     ['ring', cx, cy, rx, ry, stroke, rgba, clip]        the band between radii r ± stroke / 2
- *     ['image', Framebuffer, Affine, opacity 1..255, Filter, clip]
+ *     ['image', Framebuffer, Affine, opacity 1..255, Filter, style, clip]
+ *                                                         style: null, or ['tint' => 0xRRGGBBAA, 'window' => [u0, v0, u1, v1]|null (source pixels that paint),
+ *                                                         'round' => [x0, y0, x1, y1, [tl, tr, br, bl]]|null (the box whose rounded rect the image is cut to, in pixels)]
  *     ['spans', bytes, rgba, clip]                        whole pixels, already inside the clip, rows top to bottom; 7 bytes each: y, x, length (uint16 LE), coverage 255
  *     ['roundrect', x0, y0, x1, y1, [tl, tr, br, bl], rgba, clip]
  *     ['roundring', x0, y0, x1, y1, [tl, tr, br, bl], inset, rgba, clip]   the band inside the box, inset wide
- *     ['shadow', x0, y0, x1, y1, radius, blur, rgba, clip]                  the box already moved blur / 4 down
+ *     ['shadow', x0, y0, x1, y1, radius, blur, rgba, clip]                  the box already moved by the caller's offset
  *     ['glyphs', TrueTypeFont, pixelSize, glyphs, rgba, Region box, clip]
  *                                                         glyphs: list of [face, glyph, maskLeft, maskTop, style], the mask's
  *                                                         top-left in framebuffer pixels; box: the union of the masks before the clip
@@ -356,6 +364,79 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $kept === [] ? $this : $this->path($kept, $rule, $color);
     }
 
+    public function fill(Path $path, Color|Gradient $paint, FillRule $rule = FillRule::NON_ZERO): static
+    {
+        $this->open('fill');
+        $kept = [];
+        foreach ($this->deviceSubpaths($path) as ['points' => $points]) {
+            if (count($points) >= 3) {
+                $kept[] = $points;
+            }
+        }
+
+        return $kept === [] ? $this : $this->painted($kept, $rule, $paint);
+    }
+
+    public function stroke(Path $path, Color|Gradient $paint, StrokeStyle $style): static
+    {
+        $this->open('stroke');
+        $m = $this->matrix;
+        $squaredA = $m->a * $m->a + $m->b * $m->b;
+        $squaredC = $m->c * $m->c + $m->d * $m->d;
+        $scale = max($squaredA, $squaredC, 1.0);
+        if (abs($squaredA - $squaredC) > 1e-9 * $scale || abs($m->a * $m->c + $m->b * $m->d) > 1e-9 * $scale) {
+            throw DrawingException::unevenStroke();
+        }
+        $factor = sqrt($squaredA);
+        $width = $this->strokeWidth($style->width);
+        $contours = [];
+        foreach ($this->deviceSubpaths($path) as ['points' => $points, 'closed' => $closed]) {
+            $pieces = $style->dash === []
+                ? [['points' => $points, 'closed' => $closed, 'direction' => null]]
+                : Stroker::dashed($points, $closed, array_map(fn ($l) => $l * $factor, $style->dash), $style->dashOffset * $factor);
+            foreach ($pieces as $piece) {
+                foreach (Stroker::outline($piece['points'], $width, $piece['closed'], $style->cap, $style->join, $style->miterLimit, $piece['direction']) as $flat) {
+                    $contours[] = array_chunk($flat, 2);
+                }
+            }
+        }
+
+        return $contours === [] || $width <= 0 ? $this : $this->painted($contours, FillRule::NON_ZERO, $paint);
+    }
+
+    /** Contours already through the transform, in a colour or a gradient. */
+    private function painted(array $contours, FillRule $rule, Color|Gradient $paint): static
+    {
+        if ($paint instanceof Color) {
+            return $this->path($contours, $rule, $paint);
+        }
+        $inverse = $paint->toGradientSpace($this->matrix);
+        if (! is_null($inverse) && ! $this->clip->isEmpty()) {
+            $this->recording[] = ['gradpath', $contours, $rule, ['kind' => $paint->kind(), 'inverse' => $inverse, 'spread' => $paint->spread, 'ramp' => $paint->ramp()], $this->clip];
+        }
+
+        return $this;
+    }
+
+    /**
+     * The path through the transform, checked against the limit, flattened within a quarter pixel.
+     *
+     * @return list<array{points: list<array{float, float}>, closed: bool}>
+     */
+    private function deviceSubpaths(Path $path): array
+    {
+        $device = $path->transformed($this->matrix);
+        foreach ($device->ops() as $op) {
+            for ($i = 1; $i < count($op); $i++) {
+                if (! is_finite($op[$i]) || abs($op[$i]) > self::LIMIT) {
+                    throw DrawingException::pastLimit('path', (float) $op[$i]);
+                }
+            }
+        }
+
+        return $device->flatten(0.25);
+    }
+
     public function fillEllipse(float $cx, float $cy, float $rx, float $ry, Color $color): static
     {
         $this->open('fillEllipse');
@@ -395,30 +476,76 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $this;
     }
 
-    public function image(Framebuffer $source, float $x, float $y, ?float $width = null, ?float $height = null, float $opacity = 1.0, Filter $filter = Filter::NEAREST): static
+    public function image(Framebuffer $source, float $x, float $y, ?float $width = null, ?float $height = null, float $opacity = 1.0, Filter $filter = Filter::NEAREST, ?array $radii = null, ?Color $tint = null, ?array $sourceRect = null): static
     {
         $this->open('image');
-        $width ??= (float) $source->viewportWidth();
-        $height ??= (float) $source->viewportHeight();
+        [$sx, $sy, $sw, $sh, $window] = self::sourceRect($sourceRect, (float) $source->viewportWidth(), (float) $source->viewportHeight());
+        $width ??= abs($sw);
+        $height ??= abs($sh);
         self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'opacity' => $opacity]);
         if ($opacity < 0.0 || $opacity > 1.0) {
             throw new DrawingException("The opacity is 0..1, got {$opacity}.");
         }
         $alpha = (int) round($opacity * 255);
-        if ($width <= 0 || $height <= 0 || $alpha === 0 || $this->clip->isEmpty()) {
+        $tinted = is_null($tint) ? 0xFFFFFFFF : self::rgba($tint);
+        if ($width <= 0 || $height <= 0 || $alpha === 0 || ($tinted & 0xFF) === 0 || $this->clip->isEmpty()) {
             return $this;
+        }
+        $radii = is_null($radii) ? null : self::heldRadii($radii, $width, $height);
+        if (! is_null($radii) && ! $this->even()) {
+            throw DrawingException::unevenRoundedImage();
         }
 
         // Its four corners, to hold the placed image to the same limit as every other shape.
         $this->corners($x, $y, $width, $height);
+        // the destination box takes the source rect: its left edge shows $sx, its right edge $sx + $sw (a negative size mirrors)
         $placement = $this->matrix
             ->multiply(Affine::translation($x, $y))
-            ->multiply(Affine::scaling($width / $source->viewportWidth(), $height / $source->viewportHeight()));
-        if (! is_null($placement->inverse())) {
-            $this->recording[] = ['image', $source, $placement, $alpha, $filter, $this->clip];
+            ->multiply(Affine::scaling($width / $sw, $height / $sh))
+            ->multiply(Affine::translation(-$sx, -$sy));
+        if (is_null($placement->inverse())) {
+            return $this;
         }
+        $round = null;
+        if (! is_null($radii)) {
+            $s = $this->matrix->a;
+            [$x0, $y0] = $this->point($x, $y);
+            [$x1, $y1] = $this->point($x + $width, $y + $height);
+            $round = [$x0, $y0, $x1, $y1, [$radii[0] * $s, $radii[1] * $s, $radii[2] * $s, $radii[3] * $s]];
+        }
+        $style = $tinted === 0xFFFFFFFF && is_null($window) && is_null($round) ? null : ['tint' => $tinted, 'window' => $window, 'round' => $round];
+        $this->recording[] = ['image', $source, $placement, $alpha, $filter, $style, $this->clip];
 
         return $this;
+    }
+
+    /**
+     * The source rect [x, y, w, h] in source pixels: a negative w or h mirrors that axis (the destination's
+     * left or top edge shows x or y, its right or bottom edge x + w or y + h). It must be a non-empty rect
+     * inside the source. Null is the whole source.
+     *
+     * @param  array<int, mixed>|null  $rect
+     * @return array{float, float, float, float, array{float, float, float, float}|null} x, y, w, h, and the painted window [u0, v0, u1, v1]; the window is null for the whole source
+     *
+     * @throws DrawingException When the rect is not four finite numbers, is empty, or reaches outside the source.
+     */
+    private static function sourceRect(?array $rect, float $width, float $height): array
+    {
+        if (is_null($rect)) {
+            return [0.0, 0.0, $width, $height, null];
+        }
+        if (! array_is_list($rect) || count($rect) !== 4) {
+            throw new DrawingException('A source rect is a list of four numbers: [x, y, w, h].');
+        }
+        [$x, $y, $w, $h] = array_map(fn (mixed $n): float => is_int($n) || is_float($n) ? (float) $n : throw new DrawingException('A source rect is a list of four numbers: [x, y, w, h].'), $rect);
+        self::finite(['source x' => $x, 'source y' => $y, 'source w' => $w, 'source h' => $h]);
+        [$u0, $u1] = [min($x, $x + $w), max($x, $x + $w)];
+        [$v0, $v1] = [min($y, $y + $h), max($y, $y + $h)];
+        if ($w === 0.0 || $h === 0.0 || $u0 < 0.0 || $v0 < 0.0 || $u1 > $width || $v1 > $height) {
+            throw new DrawingException("The source rect [{$x}, {$y}, {$w}, {$h}] is empty or outside the {$width} x {$height} source.");
+        }
+
+        return [$x, $y, $w, $h, [$u0, $v0, $u1, $v1]];
     }
 
     public function roundRect(float $x, float $y, float $width, float $height, array $radii, Color $fill, ?Color $border = null, float $borderWidth = 0.0): static
@@ -468,10 +595,10 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $this;
     }
 
-    public function shadow(float $x, float $y, float $width, float $height, float $radius, float $blur, Color $color): static
+    public function shadow(float $x, float $y, float $width, float $height, float $radius, float $blur, Color $color, float $dx = 0.0, float $dy = 0.0): static
     {
         $this->open('shadow');
-        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'radius' => $radius, 'blur' => $blur]);
+        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'radius' => $radius, 'blur' => $blur, 'dx' => $dx, 'dy' => $dy]);
         if ($width <= 0 || $height <= 0) {
             return $this;
         }
@@ -482,8 +609,8 @@ abstract class RenderingEngine implements RenderingEngineContract
 
         $s = $this->matrix->a;
         $blur = max(0.0, $blur);
-        [$x0, $y0] = $this->point($x, $y + $blur / 4);
-        [$x1, $y1] = $this->point($x + $width, $y + $height + $blur / 4);
+        [$x0, $y0] = $this->point($x + $dx, $y + $dy);
+        [$x1, $y1] = $this->point($x + $width + $dx, $y + $height + $dy);
         $radius = max(0.0, min($radius, min($width, $height) / 2));
         if (! $this->clip->isEmpty()) {
             $this->recording[] = ['shadow', $x0, $y0, $x1, $y1, $radius * $s, $blur * $s, self::rgba($color), $this->clip];
@@ -778,11 +905,11 @@ abstract class RenderingEngine implements RenderingEngineContract
         }
 
         [$x0, $y0, $x1, $y1] = match ($command[0]) {
-            'path' => self::extent(array_merge(...$command[1]), 1.0),
+            'path', 'gradpath' => self::extent(array_merge(...$command[1]), 1.0),
             'polyline' => self::extent($command[1], 2.0 * $command[2] + 1.0),
             'ellipse' => [$command[1] - $command[3] - 1.0, $command[2] - $command[4] - 1.0, $command[1] + $command[3] + 1.0, $command[2] + $command[4] + 1.0],
             'ring' => [$command[1] - $command[3] - $command[5] / 2 - 1.0, $command[2] - $command[4] - $command[5] / 2 - 1.0, $command[1] + $command[3] + $command[5] / 2 + 1.0, $command[2] + $command[4] + $command[5] / 2 + 1.0],
-            'image' => self::extent(self::placedCorners($command[1], $command[2]), 1.0),
+            'image' => self::extent(self::placedCorners($command[1], $command[2], $command[5]['window'] ?? null), 1.0),
             'spans' => self::spansExtent($command[1]),
             'roundrect', 'roundring' => [$command[1] - 1.0, $command[2] - 1.0, $command[3] + 1.0, $command[4] + 1.0],
             'shadow' => [$command[1] - $command[6] - 1.0, $command[2] - $command[6] - 1.0, $command[3] + $command[6] + 1.0, $command[4] + $command[6] + 1.0],
@@ -882,13 +1009,15 @@ abstract class RenderingEngine implements RenderingEngineContract
         return [min($xs) - $grow, min($ys) - $grow, max($xs) + $grow, max($ys) + $grow];
     }
 
-    /** @return list<array{float, float}> An image source's corners, placed. */
-    private static function placedCorners(Framebuffer $source, Affine $placement): array
+    /**
+     * @param  array{float, float, float, float}|null  $window  The part of the source that paints; null for all of it.
+     * @return list<array{float, float}> An image source's corners (or the window's), placed.
+     */
+    private static function placedCorners(Framebuffer $source, Affine $placement, ?array $window = null): array
     {
-        $width = (float) $source->viewportWidth();
-        $height = (float) $source->viewportHeight();
+        [$u0, $v0, $u1, $v1] = $window ?? [0.0, 0.0, (float) $source->viewportWidth(), (float) $source->viewportHeight()];
 
-        return [$placement->apply(0.0, 0.0), $placement->apply($width, 0.0), $placement->apply($width, $height), $placement->apply(0.0, $height)];
+        return [$placement->apply($u0, $v0), $placement->apply($u1, $v0), $placement->apply($u1, $v1), $placement->apply($u0, $v1)];
     }
 
     /** @return array{float, float, float, float} The pixels a span list covers. */

@@ -7,12 +7,15 @@ use Surface\Contracts\Framebuffers\Framebuffer;
 use Surface\Contracts\Framebuffers\PagedFramebuffer;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Framebuffers\RingFramebuffer;
+use Surface\Contracts\Framebuffers\Spans;
 use Surface\Contracts\Rasterize\Edges;
 use Surface\Contracts\Rasterize\RasterizeDriver;
 use Surface\Contracts\Rasterize\Rasterizer;
 use Surface\Drawing\RenderingEngine;
 use Surface\Framebuffers\PixelMapper;
 use Surface\Framebuffers\PixelMapperMode;
+use Surface\NutsAndBolts\Affine;
+use Surface\NutsAndBolts\GradientSpread;
 
 /**
  * The software rendering engine. It draws on the CPU into the framebuffer it
@@ -94,8 +97,22 @@ class VelvetGE extends RenderingEngine
                 continue;
             }
             if ($command[0] === 'image') {
-                [, $source, $placement, $opacity, $filter, $clip] = $command;
-                $target->paintImage($source, $placement, $opacity, $filter, $clip);
+                [, $source, $placement, $opacity, $filter, $style, $clip] = $command;
+                $coverage = null;
+                if (isset($style['round'])) {
+                    // rounded corners: the image paints through the coverage of the rounded box, as roundRect() would fill it
+                    $area = $clip->intersect($rows);
+                    if (is_null($area)) {
+                        continue;
+                    }
+                    [$x0, $y0, $x1, $y1, $radii] = $style['round'];
+                    $raster = $this->rasterizers["{$area->x},{$area->y},{$area->width},{$area->height}"] ??= $this->rasterize->rasterizer($area, $this->edges);
+                    $coverage = $raster->fillRoundRect($x0, $y0, $x1 - $x0, $y1 - $y0, $radii);
+                    if ($coverage === '') {
+                        continue;
+                    }
+                }
+                $target->paintImage($source, $placement, $opacity, $filter, $clip, $style['tint'] ?? 0xFFFFFFFF, $style['window'] ?? null, $coverage);
 
                 continue;
             }
@@ -118,6 +135,15 @@ class VelvetGE extends RenderingEngine
                 continue;
             }
             $raster = $this->rasterizers["{$clip->x},{$clip->y},{$clip->width},{$clip->height}"] ??= $this->rasterize->rasterizer($clip, $this->edges);
+            if ($command[0] === 'gradpath') {
+                $spans = $raster->fillPath($command[1], $command[2]);
+                if ($spans !== '') {
+                    [$g, $m] = [$command[3], $command[3]['inverse']];
+                    $target->paintGradient($spans, $g['ramp'], $g['kind'], $g['spread'], [$m->a, $m->b, $m->c, $m->d, $m->e, $m->f]);
+                }
+
+                continue;
+            }
             [$spans, $rgba] = match ($command[0]) {
                 'path' => [$raster->fillPath($command[1], $command[2]), $command[3]],
                 'polyline' => [$raster->polyline($command[1], $command[2], $command[3]), $command[4]],
@@ -213,4 +239,11 @@ class VelvetGE extends RenderingEngine
 
         return $this->glyphRuns[$key] = $runs;
     }
+
+    /**
+     * The spans in a gradient: a temporary RGBA image of the gradient's colour at every pixel the spans cover,
+     * painted through those spans as their coverage, so the edge is the path's.
+     *
+     * @param  array{kind: string, inverse: Affine, spread: GradientSpread, ramp: string}  $gradient
+     */
 }

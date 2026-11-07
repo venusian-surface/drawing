@@ -10,6 +10,7 @@ enum Op
     case SOLID;
     case STENCIL_FILL;
     case COVER;
+    case COVER_GRADIENT;
     case ELLIPSE;
     case RING;
     case UPLOAD;

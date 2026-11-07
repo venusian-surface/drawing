@@ -3,9 +3,14 @@
 namespace Surface\Drawing\Gpu;
 
 use Surface\Contracts\Drawing\DrawingException;
+use Surface\Contracts\Framebuffers\FormatSpec;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Framebuffers\Spans;
 use Surface\Contracts\Rasterize\FillRule;
+use Surface\Framebuffers\Native\NativeFullFramebuffer;
+use Surface\NutsAndBolts\Affine;
+use Surface\NutsAndBolts\Gradient;
+use Surface\NutsAndBolts\GradientSpread;
 use Surface\Rasterize\Stroker;
 
 /**
@@ -70,6 +75,11 @@ final class Lowering
 
                 return;
 
+            case 'gradpath':
+                $this->fill($command[1], $command[2], 0, $command[4], $command[3]);
+
+                return;
+
             case 'polyline':
                 $outline = array_map(fn (array $flat): array => array_chunk($flat, 2), Stroker::outline($command[1], $command[2], $command[3]));
                 $this->fill($outline, FillRule::NON_ZERO, $command[4], $command[5]);
@@ -93,20 +103,21 @@ final class Lowering
                 return;
 
             case 'image':
-                [, $source, $placement, $opacity, $filter, $clip] = $command;
+                [, $source, $placement, $opacity, $filter, $style, $clip] = $command;
                 $id = spl_object_id($source);
                 if (! isset($this->textures[$id])) {
                     $this->textures[$id] = count($this->textures);
                     $this->operations[] = [Op::UPLOAD, $this->textures[$id], $source];
                 }
-                $width = (float) $source->viewportWidth();
-                $height = (float) $source->viewportHeight();
-                [$ax, $ay] = $placement->apply(0.0, 0.0);
-                [$bx, $by] = $placement->apply($width, 0.0);
-                [$cx, $cy] = $placement->apply($width, $height);
-                [$dx, $dy] = $placement->apply(0.0, $height);
+                // the quad covers the window's footprint, or the whole source's
+                [$u0, $v0, $u1, $v1] = $style['window'] ?? [0.0, 0.0, (float) $source->viewportWidth(), (float) $source->viewportHeight()];
+                [$ax, $ay] = $placement->apply($u0, $v0);
+                [$bx, $by] = $placement->apply($u1, $v0);
+                [$cx, $cy] = $placement->apply($u1, $v1);
+                [$dx, $dy] = $placement->apply($u0, $v1);
                 $this->clip($clip);
-                $this->operations[] = [Op::IMAGE, $this->push([$ax, $ay, $bx, $by, $cx, $cy, $ax, $ay, $cx, $cy, $dx, $dy]), $this->textures[$id], $placement->inverse(), $opacity, $filter];
+                $this->operations[] = [Op::IMAGE, $this->push([$ax, $ay, $bx, $by, $cx, $cy, $ax, $ay, $cx, $cy, $dx, $dy]), $this->textures[$id], $placement->inverse(), $opacity, $filter,
+                    $style['tint'] ?? 0xFFFFFFFF, $style['window'] ?? null, $style['round'] ?? null];
 
                 return;
 
@@ -162,8 +173,9 @@ final class Lowering
 
     /**
      * @param  list<list<array{float, float}>>  $contours
+     * @param  array{kind: string, inverse: Affine, spread: GradientSpread, ramp: string}|null  $gradient
      */
-    private function fill(array $contours, FillRule $rule, int $rgba, Region $clip): void
+    private function fill(array $contours, FillRule $rule, int $rgba, Region $clip, ?array $gradient = null): void
     {
         $floats = [];
         $xs = [];
@@ -184,7 +196,23 @@ final class Lowering
 
         $this->clip($clip);
         $this->operations[] = [Op::STENCIL_FILL, $this->push($floats), intdiv(count($floats), 2), $rule];
-        $this->operations[] = [Op::COVER, $this->quad(floor(min($xs)), floor(min($ys)), ceil(max($xs)), ceil(max($ys))), $rgba];
+        $quad = $this->quad(floor(min($xs)), floor(min($ys)), ceil(max($xs)), ceil(max($ys)));
+        if (is_null($gradient)) {
+            $this->operations[] = [Op::COVER, $quad, $rgba];
+
+            return;
+        }
+        // the ramp is a source of its own; its UPLOAD op holds it, so its object id is not reused
+        $ramp = new NativeFullFramebuffer(FormatSpec::rgba8(), Gradient::STEPS, 1);
+        $ramp->writeRgba8($gradient['ramp'], Gradient::STEPS, 1);
+        $texture = count($this->textures);
+        $this->textures[spl_object_id($ramp)] = $texture;
+        $this->operations[] = [Op::UPLOAD, $texture, $ramp];
+        $this->operations[] = [Op::COVER_GRADIENT, $quad, $texture, $gradient['kind'] === 'linear' ? 0 : 1, $gradient['inverse'], match ($gradient['spread']) {
+            GradientSpread::PAD => 0,
+            GradientSpread::REPEAT => 1,
+            GradientSpread::REFLECT => 2,
+        }];
     }
 
     /** @param list<array<int, mixed>> $commands */

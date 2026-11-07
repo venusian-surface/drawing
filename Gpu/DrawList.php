@@ -15,13 +15,28 @@ namespace Surface\Drawing\Gpu;
  *     [Op::STENCIL_FILL, first, count, FillRule]            a triangle list into the stencil: NON_ZERO counts up on
  *                                                           front faces and down on back faces, EVEN_ODD inverts
  *     [Op::COVER, first, rgba]                              a quad, drawn where the stencil is non-zero, resetting it to zero
+ *     [Op::COVER_GRADIENT, first, texture, kind, Affine, spread]
+ *                                                           the same quad, drawn in a gradient: `texture` is the ramp, a 256 x 1
+ *                                                           RGBA8 source made by an UPLOAD just before; `kind` 0 linear, 1 radial;
+ *                                                           the Affine takes a target pixel's centre to the gradient's own space,
+ *                                                           where t is x (linear) or the distance from the origin (radial); `spread`
+ *                                                           0 pad, 1 repeat, 2 reflect applies to t; the pixel is ramp entry
+ *                                                           floor(t * 255 + 1/2), with the alpha of a shape of that alpha: (entry
+ *                                                           alpha * coverage + 127) / 255, the coverage the stencil's
  *     [Op::ELLIPSE, first, cx, cy, rx, ry, rgba]            a quad; coverage is the ellipse's, computed per pixel
  *     [Op::RING, first, cx, cy, rx, ry, stroke, rgba]       a quad; coverage is the band's between radii r ± stroke / 2
  *     [Op::UPLOAD, texture, Framebuffer]                    make the source texture number `texture`, from its toRgba8(); an
  *                                                           HdrImage's from its rgba16f() on a target in an HDR colour space
- *     [Op::IMAGE, first, texture, Affine, opacity, Filter]  a quad over the placed corners; the Affine maps a target pixel's
- *                                                           centre to source pixels, sampled as paintImage() samples;
- *                                                           opacity 1..255
+ *     [Op::IMAGE, first, texture, Affine, opacity, Filter, tint, window, round]
+ *                                                           a quad over the placed corners of the window (or of the whole source);
+ *                                                           the Affine maps a target pixel's centre to source pixels, sampled as
+ *                                                           paintImage() samples; opacity 1..255. Each sampled pixel is multiplied by
+ *                                                           `tint` (0xRRGGBBAA, per channel, alpha too: c = (c × t + 127) / 255), then
+ *                                                           its alpha by the opacity the same way, then by the coverage of `round`.
+ *                                                           `window` [u0, v0, u1, v1] (null: all): a pixel whose centre maps outside it
+ *                                                           is skipped; smooth sampling still reads the whole texture, held at its
+ *                                                           edges. `round` [x0, y0, x1, y1, [tl, tr, br, bl]] (null: none): coverage
+ *                                                           per sample as ROUNDRECT's for that box and those radii, 0 outside
  *     [Op::RECTS, first, count, rgba]                       count / 6 quads, one per span of whole pixels
  *     [Op::ATLAS, atlas, width, height]                     make texture number `atlas`, single-channel 8-bit, all zero; it is
  *                                                           kept across frames until the next ATLAS for that number or release();
