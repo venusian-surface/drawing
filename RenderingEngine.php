@@ -3,6 +3,9 @@
 namespace Surface\Drawing;
 
 use Surface\Contracts\Drawing\DrawingException;
+use Surface\Contracts\Drawing\Effects\Displace;
+use Surface\Contracts\Drawing\Effects\FilterChain;
+use Surface\Contracts\Drawing\Effects\Glass;
 use Surface\Contracts\Drawing\RenderingEngine as RenderingEngineContract;
 use Surface\Contracts\Drawing\StrokeStyle;
 use Surface\Contracts\Fonts\Font;
@@ -48,6 +51,10 @@ use Throwable;
  *     ['roundrect', x0, y0, x1, y1, [tl, tr, br, bl], rgba, clip]
  *     ['roundring', x0, y0, x1, y1, [tl, tr, br, bl], inset, rgba, clip]   the band inside the box, inset wide
  *     ['shadow', x0, y0, x1, y1, radius, blur, rgba, clip]                  the box already moved by the caller's offset
+ *     ['glass', Region area, [x0, y0, x1, y1, [tl, tr, br, bl]], look, blur, shadow, clip]
+ *                                                         shadow: null, or a 'shadow' command painted between the backdrop's capture and the pane
+ *                                                         look: [frost, refraction, bevel, saturation, light, grain, tint,
+ *                                                         rim, alpha] in device pixels; blur: the radius in device pixels
  *     ['glyphs', TrueTypeFont, pixelSize, glyphs, rgba, Region box, clip]
  *                                                         glyphs: list of [face, glyph, maskLeft, maskTop, style], the mask's
  *                                                         top-left in framebuffer pixels; box: the union of the masks before the clip
@@ -142,7 +149,7 @@ abstract class RenderingEngine implements RenderingEngineContract
         }
 
         // A scrolled region no longer holds what the last frame drew there: it is drawn again.
-        $this->damage = $this->merge([...$this->changed($before, $commands), ...$scrolled]);
+        $this->damage = $this->withBackdrops($this->merge([...$this->changed($before, $commands), ...$scrolled]), $commands);
         if ($this->damage !== []) {
             $this->execute($this->keepsFrame($framebuffer) ? $this->scissor($commands, $this->damage) : $commands);
         }
@@ -425,8 +432,17 @@ abstract class RenderingEngine implements RenderingEngineContract
      */
     private function deviceSubpaths(Path $path): array
     {
-        $device = $path->transformed($this->matrix);
+        $m = $this->matrix;
+        $device = $m->a === 1.0 && $m->b === 0.0 && $m->c === 0.0 && $m->d === 1.0 && $m->e === 0.0 && $m->f === 0.0 ? $path : $path->transformed($m);
         foreach ($device->ops() as $op) {
+            if (count($op) < 2) {
+                continue;
+            }
+            // one pass a segment in C; a coordinate that fails it is found by the slow loop, which names it
+            $numbers = array_slice($op, 1);
+            if (is_finite(array_sum($numbers)) && max($numbers) <= self::LIMIT && min($numbers) >= -self::LIMIT) {
+                continue;
+            }
             for ($i = 1; $i < count($op); $i++) {
                 if (! is_finite($op[$i]) || abs($op[$i]) > self::LIMIT) {
                     throw DrawingException::pastLimit('path', (float) $op[$i]);
@@ -619,7 +635,89 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $this;
     }
 
+    public function layer(float $x, float $y, float $width, float $height, callable $draw, float $opacity = 1.0, ?array $radii = null, ?FilterChain $filter = null, ?FilterChain $backdrop = null): static
+    {
+        $this->open('layer');
+        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'opacity' => $opacity]);
+        if ($opacity < 0.0 || $opacity > 1.0) {
+            throw new DrawingException("The opacity is 0..1, got {$opacity}.");
+        }
+        $alpha = (int) round($opacity * 255);
+        if ($width <= 0 || $height <= 0 || $this->clip->isEmpty() || ($alpha === 0 && is_null($backdrop))) {
+            return $this;
+        }
+        if (! $this->even()) {
+            throw DrawingException::unevenLayer();
+        }
+        $radii = is_null($radii) ? [0.0, 0.0, 0.0, 0.0] : self::heldRadii($radii, $width, $height);
+        $s = $this->matrix->a;
+        [$x0, $y0] = $this->point($x, $y);
+        [$x1, $y1] = $this->point($x + $width, $y + $height);
+        $edge = new Region((int) floor($x0), (int) floor($y0), (int) ceil($x1) - (int) floor($x0), (int) ceil($y1) - (int) floor($y0));
+        $area = $this->clip->intersect($edge);
+        if (is_null($area)) {
+            return $this;
+        }
+
+        // the children are recorded in a frame of their own, clipped to the layer
+        [$recording, $clip, $stack] = [$this->recording, $this->clip, $this->stack];
+        $this->recording = [];
+        $this->clip = $area;
+        $this->stack = [];
+        try {
+            $draw($this);
+            if ($this->stack !== []) {
+                throw DrawingException::badLayer('the drawing left a push() without its pop().');
+            }
+            $children = $this->recording;
+        } finally {
+            [$this->recording, $this->clip, $this->stack] = [$recording, $clip, $stack];
+        }
+        if ($children === [] && is_null($filter) && is_null($backdrop)) {
+            return $this;
+        }
+        $geometry = [$x0, $y0, $x1, $y1, [$radii[0] * $s, $radii[1] * $s, $radii[2] * $s, $radii[3] * $s]];
+        $this->recording[] = ['layer', $area, $geometry, $children, $alpha, $filter, $backdrop, $area];
+
+        return $this;
+    }
+
     /** Upright and even: no turn or shear, x and y scaled alike, by more than 0. */
+    public function glass(float $x, float $y, float $width, float $height, ?array $radii, Glass $glass, float $opacity = 1.0): static
+    {
+        $this->open('glass');
+        self::finite(['x' => $x, 'y' => $y, 'width' => $width, 'height' => $height, 'opacity' => $opacity]);
+        if ($opacity < 0.0 || $opacity > 1.0) {
+            throw new DrawingException("The opacity is 0..1, got {$opacity}.");
+        }
+        $alpha = (int) round($opacity * 255);
+        if ($width <= 0 || $height <= 0 || $alpha === 0 || $this->clip->isEmpty()) {
+            return $this;
+        }
+        if (! $this->even()) {
+            throw new DrawingException('glass() needs an upright transform that scales x and y alike.');
+        }
+        $radii = is_null($radii) ? [0.0, 0.0, 0.0, 0.0] : self::heldRadii($radii, $width, $height);
+        $s = $this->matrix->a;
+        [$x0, $y0] = $this->point($x, $y);
+        [$x1, $y1] = $this->point($x + $width, $y + $height);
+        $area = $this->clip->intersect(new Region((int) floor($x0), (int) floor($y0), (int) ceil($x1) - (int) floor($x0), (int) ceil($y1) - (int) floor($y0)));
+        if (is_null($area)) {
+            return $this;
+        }
+        // a blur under a pixel and a half has nothing to blur: the pane shows the sharp capture (the old blur step was skipped below 0.75 px too)
+        $frost = $glass->blur * $s < 0.75 ? 0.0 : $glass->frost;
+        $look = [$frost, $glass->refraction * $s, $glass->bevel * $s, $glass->saturation, $glass->light, $glass->grain,
+            is_null($glass->tint) ? 0 : self::rgba($glass->tint), is_null($glass->rim) ? 0 : self::rgba($glass->rim), $alpha];
+        $device = [$radii[0] * $s, $radii[1] * $s, $radii[2] * $s, $radii[3] * $s];
+        $shadow = $glass->shadow > 0 && ! is_null($glass->shadowColor)
+            ? ['shadow', $x0, $y0, $x1, $y1, $device[0], $glass->shadow * $s, self::rgba($glass->shadowColor), $this->clip]
+            : null;
+        $this->recording[] = ['glass', $area, [$x0, $y0, $x1, $y1, $device], $look, $glass->blur * $s, $shadow, $area];
+
+        return $this;
+    }
+
     private function even(): bool
     {
         $m = $this->matrix;
@@ -877,7 +975,7 @@ abstract class RenderingEngine implements RenderingEngineContract
         for ($i = 0, $n = max(count($before), count($after)); $i < $n; $i++) {
             $old = $before[$i] ?? null;
             $new = $after[$i] ?? null;
-            if (! is_null($old) && ! is_null($new) && $new[0] !== 'image' && $old == $new) {
+            if (! is_null($old) && ! is_null($new) && $new[0] !== 'image' && ! self::volatile($new) && $old == $new) {
                 continue;
             }
             foreach ([$old, $new] as $command) {
@@ -890,6 +988,72 @@ abstract class RenderingEngine implements RenderingEngineContract
         return $this->merge($boxes);
     }
 
+    /** A layer whose pixels can change with nothing in the command changing: an image or a displacement map inside it holds a framebuffer. */
+    private static function volatile(array $command): bool
+    {
+        if ($command[0] !== 'layer') {
+            return false;
+        }
+        foreach ([$command[5], $command[6]] as $chain) {
+            if (! is_null($chain) && array_filter($chain->steps, fn ($step): bool => $step instanceof Displace) !== []) {
+                return true;
+            }
+        }
+        foreach ($command[3] as $child) {
+            if ($child[0] === 'image' || self::volatile($child)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * A layer with a backdrop reads the pixels around its box, filters them and lays them back: what it shows depends on
+     * everything under it up to the chain's reach. When any of that is redrawn the whole read area is redrawn with it, and
+     * the area may reach the next layer's.
+     *
+     * @param  list<Region>  $regions
+     * @param  list<array<int, mixed>>  $commands
+     * @return list<Region>
+     */
+    private function withBackdrops(array $regions, array $commands): array
+    {
+        $outers = [];
+        foreach ($commands as $command) {
+            if ($command[0] === 'layer' && ! is_null($command[6])) {
+                $outers[] = self::grown($command[1], $command[6]->reach(), $this->surface());
+            }
+            if ($command[0] === 'glass') {
+                $outers[] = self::grown($command[1], Glass::margin($command[4], $command[3][1]), $this->surface());
+            }
+        }
+        do {
+            $grew = false;
+            foreach ($outers as $i => $outer) {
+                foreach ($regions as $region) {
+                    if (! is_null($region->intersect($outer))) {
+                        $regions = $this->merge([...$regions, $outer]);
+                        unset($outers[$i]);
+                        $grew = true;
+
+                        continue 2;
+                    }
+                }
+            }
+        } while ($grew);
+
+        return $regions;
+    }
+
+    /** The region grown by $reach pixels (rounded up) on every side, kept on the surface. */
+    protected static function grown(Region $region, float $reach, Region $surface): Region
+    {
+        $by = (int) ceil($reach);
+
+        return (new Region($region->x - $by, $region->y - $by, $region->width + 2 * $by, $region->height + 2 * $by))->intersect($surface);
+    }
+
     /**
      * The whole pixels a command can write, cut by its clip: its geometry,
      * grown by a pixel for anti-aliased edges, and for a stroke by the miter
@@ -897,8 +1061,20 @@ abstract class RenderingEngine implements RenderingEngineContract
      *
      * @param  array<int, mixed>  $command
      */
+    /** The pixels a command can write, null for none: what GlassGroups takes as drawn. */
+    public function commandBox(array $command): ?Region
+    {
+        return $this->box($command);
+    }
+
     private function box(array $command): ?Region
     {
+        if ($command[0] === 'glass' && $command[5] !== null) {
+            $own = $this->box([...array_slice($command, 0, 5), null, $command[6]]);
+            $shadow = $this->box($command[5]);
+
+            return $own === null ? $shadow : ($shadow === null ? $own : $own->union($shadow));
+        }
         $surface = $this->surface();
         if ($command[0] === 'clear') {
             return $command[2] ?? $surface;
@@ -914,6 +1090,7 @@ abstract class RenderingEngine implements RenderingEngineContract
             'roundrect', 'roundring' => [$command[1] - 1.0, $command[2] - 1.0, $command[3] + 1.0, $command[4] + 1.0],
             'shadow' => [$command[1] - $command[6] - 1.0, $command[2] - $command[6] - 1.0, $command[3] + $command[6] + 1.0, $command[4] + $command[6] + 1.0],
             'glyphs' => [$command[5]->x, $command[5]->y, $command[5]->right(), $command[5]->bottom()],
+            'layer', 'glass' => [$command[1]->x, $command[1]->y, $command[1]->right(), $command[1]->bottom()],
         };
         $x0 = (int) max(floor($x0), 0);
         $y0 = (int) max(floor($y0), 0);
@@ -974,6 +1151,25 @@ abstract class RenderingEngine implements RenderingEngineContract
                     if (! is_null($area)) {
                         $out[] = ['clear', $command[1], $area];
                     }
+
+                    continue;
+                }
+
+                if ($command[0] === 'glass') {
+                    // the pane and its shadow, each cut to the region; a region that only reaches the shadow gets the shadow alone
+                    $shadow = $command[5];
+                    if ($shadow !== null) {
+                        $shadow[8] = $shadow[8]->intersect($region);
+                        $shadow = $shadow[8] === null ? null : $shadow;
+                    }
+                    $area = $command[6]->intersect($region);
+                    if ($area === null) {
+                        $shadow === null || $out[] = $shadow;
+
+                        continue;
+                    }
+                    [$command[5], $command[6]] = [$shadow, $area];
+                    $out[] = $command;
 
                     continue;
                 }

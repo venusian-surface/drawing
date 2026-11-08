@@ -329,13 +329,15 @@ class GpuRenderingEngine extends RenderingEngine implements SurfaceBorrower
         $this->atlas?->forget();
     }
 
+    /** @var list<string> The glass backdrops the last frame's list made (Lowering::lower()), for the device to keep. */
+    private array $backdrops = [];
+
     protected function execute(array $commands): void
     {
-        $this->device->draw(Lowering::lower($commands, $this->width(), $this->height(), $this->atlas ??= new GlyphAtlas($this->edges)));
+        $this->device->draw(Lowering::lower($commands, $this->width(), $this->height(), $this->atlas ??= new GlyphAtlas($this->edges), $this->device instanceof DrawsGlass, $this->backdrops, $this->damage(), $this->commandBox(...)));
         $this->framebuffer->drawn($this->damage());
     }
 
-    /** Four samples resolve to anti-aliased edges; one sample keeps a pixel when its centre is inside. */
     protected function samples(): int
     {
         return $this->edges === Edges::ANTIALIASED ? 4 : 1;

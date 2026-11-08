@@ -55,6 +55,29 @@ namespace Surface\Drawing\Gpu;
  *                                                           a quad blur + 1 past the box; coverage per pixel centre is
  *                                                           1 − smoothstep(−blur, blur, d), d the signed distance to the rounded box;
  *                                                           hard edges keep coverage of 128 and up, at 255
+ *     [Op::TARGET, slot, Region|null]                       the operations that follow draw into target `slot`: 0 is the frame's own target,
+ *                                                           the others are layer targets, transparent RGBA8 the size of the frame, premultiplied
+ *                                                           by the ordinary blend (a pixel is [c × a + d × (255 − a)] / 255 on a transparent
+ *                                                           one), made on first use and kept across frames; given a Region, that region of the
+ *                                                           target is first cleared to transparent black, colour and stencil. A SCISSOR does
+ *                                                           not carry over: each target begins unscissored
+ *     [Op::BACKDROP, from, into, Region]                    copy that region of target `from` into the same place in target `into`, no blending
+ *     [Op::FILTER, slot, Region, FilterChain, premultiplied, maps, tables]
+ *                                                           run the chain over that region of target `slot`, the result replacing it, straight
+ *                                                           RGBA8 (with `premultiplied` the pixels are taken as premultiplied, which a layer
+ *                                                           target's are, and straightened by (c × 255 + a / 2) / a). The steps are
+ *                                                           NativeFilters's, with its arithmetic; noise counts from the target's own origin.
+ *                                                           `maps` is displacement map texture numbers (UPLOADed before) by step index; `tables`
+ *                                                           the turbulence lattice bytes by step index (NativeFilters::noiseTables()). The
+ *                                                           chain reads and writes only inside the region
+ *     [Op::LAYER_SOURCE, texture, slot]                     make the source texture number `texture` the contents of target `slot`, as they are
+ *     [Op::GLASS_BACKDROP, slot, Region, depths, n, keep]   (devices that DrawsGlass) the frame's n-th backdrop; with keep, the pyramid the
+ *                                                           device made for the n-th last frame, unchanged; otherwise read that region of target `slot` once and take
+ *                                                           it down a dual-filter pyramid (levels 1..max(depths)) and up to 1/2 for each
+ *                                                           depth: the Kawase steps of fb_kawase_down()/up(), bilinear on the GPU
+ *     [Op::GLASS, first, geometry, look, depth, Region]      one pane over the quad at `first`: Velvet's paintGlass() steps per pixel,
+ *                                                           sampling the depth's half-size level and the capture; Region is the backdrop's
+ *                                                           after the last FILTER on it, for the IMAGE that follows
  */
 final readonly class DrawList
 {

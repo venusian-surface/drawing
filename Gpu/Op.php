@@ -22,4 +22,10 @@ enum Op
     case ROUNDRECT;
     case ROUNDRING;
     case SHADOW;
+    case TARGET;
+    case BACKDROP;
+    case FILTER;
+    case LAYER_SOURCE;
+    case GLASS_BACKDROP;
+    case GLASS;
 }

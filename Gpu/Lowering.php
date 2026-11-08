@@ -3,10 +3,18 @@
 namespace Surface\Drawing\Gpu;
 
 use Surface\Contracts\Drawing\DrawingException;
+use Surface\Contracts\Drawing\Effects\Displace;
+use Surface\Contracts\Drawing\Effects\FilterChain;
+use Surface\Contracts\Drawing\Effects\Glass;
+use Surface\Contracts\Drawing\Effects\Noise;
+use Surface\Contracts\Drawing\Effects\NoiseType;
+use Surface\Contracts\Framebuffers\Filter;
 use Surface\Contracts\Framebuffers\FormatSpec;
 use Surface\Contracts\Framebuffers\Region;
 use Surface\Contracts\Framebuffers\Spans;
+use Surface\Drawing\GlassGroups;
 use Surface\Contracts\Rasterize\FillRule;
+use Surface\Framebuffers\Native\NativeFilters;
 use Surface\Framebuffers\Native\NativeFullFramebuffer;
 use Surface\NutsAndBolts\Affine;
 use Surface\NutsAndBolts\Gradient;
@@ -31,25 +39,69 @@ final class Lowering
 
     private ?Region $scissor = null;
 
+    /** Layer targets handed out so far this frame; 0 is the frame's own target. */
+    private int $slots = 0;
+
+    /** The target the operations draw into now. */
+    private int $slot = 0;
+
+    private Region $surface;
+
     /** @var array<int, int> Texture number by the source's object id. */
     private array $textures = [];
 
-    private function __construct(private readonly ?GlyphAtlas $atlas) {}
+    /** @var list<array{region: Region, depths: list<int>, members: list<int>}> The backdrop groups of the list being lowered (GlassGroups). */
+    private array $groups = [];
+
+    /** @var array<int, int> Group by member command index, in the list being lowered. */
+    private array $memberOf = [];
+
+    /** The group whose backdrop the next panes draw from; null before the first. */
+    private ?int $group = null;
+
+    /** The index of the command being lowered in its list. */
+    private int $at = 0;
+
+    /** @var (\Closure(array<int, mixed>): ?Region)|null How far a command's pixels reach, for GlassGroups; null: every pane its own backdrop. */
+    private ?\Closure $box = null;
+
+    /** @var list<string> This frame's backdrops, by region and depths, in order: next frame's $previous. */
+    private array $backdrops = [];
+
+    /** @var list<string> The last frame's backdrops. */
+    private array $previous = [];
+
+    /** @var list<Region> This frame's damage. */
+    private array $damage = [];
+
+    private function __construct(private readonly ?GlyphAtlas $atlas, int $width, int $height, private readonly bool $glass = false)
+    {
+        $this->surface = Region::wholeSurface($width, $height);
+    }
 
     /**
      * A first pass places every glyph mask of the frame, so all ATLAS and MASK operations come before any draw.
      *
      * @param  list<array<int, mixed>>  $commands
+     * @param  list<string>  $backdrops  In: the last frame's glass backdrops (this method's own answer then); out: this frame's.
+     * @param  list<Region>  $damage  This frame's damage: a backdrop it misses, of the region and depths it had last frame, is kept.
+     * @param  (\Closure(array<int, mixed>): ?Region)|null  $box  How far a command's pixels reach (RenderingEngine::commandBox()): panes
+     *                                                              whose read areas nothing was drawn into share a backdrop. Null: each pane has its own.
      *
      * @throws DrawingException When a frame has glyphs and no atlas is given, or its masks do not fit one.
      */
-    public static function lower(array $commands, int $width, int $height, ?GlyphAtlas $atlas = null): DrawList
+    public static function lower(array $commands, int $width, int $height, ?GlyphAtlas $atlas = null, bool $glass = false, array &$backdrops = [], array $damage = [], ?\Closure $box = null): DrawList
     {
-        $lowering = new self($atlas);
+        $lowering = new self($atlas, $width, $height, $glass);
+        [$lowering->previous, $lowering->damage, $lowering->box] = [$backdrops, $damage, $box];
         $lowering->placeGlyphs($commands);
-        foreach ($commands as $command) {
+        $lowering->plan($commands);
+        foreach ($commands as $i => $command) {
+            $lowering->at = $i;
             $lowering->command($command);
         }
+
+        $backdrops = $lowering->backdrops;
 
         return new DrawList($width, $height, $lowering->vertices, $lowering->operations);
     }
@@ -72,6 +124,21 @@ final class Lowering
 
             case 'path':
                 $this->fill($command[1], $command[2], $command[3], $command[4]);
+
+                return;
+
+            case 'layer':
+                $this->layer($command);
+
+                return;
+
+            case 'glass':
+                if ($this->glass) {
+                    $this->pane($command);
+                } else {
+                    $command[5] === null || $this->command($command[5]);
+                    $this->layer(self::glassLayer($command));
+                }
 
                 return;
 
@@ -219,7 +286,7 @@ final class Lowering
     private function placeGlyphs(array $commands): void
     {
         $wanted = [];
-        foreach ($commands as $command) {
+        foreach (self::flat($commands) as $command) {
             if ($command[0] !== 'glyphs') {
                 continue;
             }
@@ -235,6 +302,139 @@ final class Lowering
             throw DrawingException::noAtlas();
         }
         $this->atlas->prepare($wanted, $this->operations);
+    }
+
+    /**
+     * The commands with the children of every layer, at any depth, in the places of the layers.
+     *
+     * @param  list<array<int, mixed>>  $commands
+     * @return list<array<int, mixed>>
+     */
+    private static function flat(array $commands): array
+    {
+        $out = [];
+        foreach ($commands as $command) {
+            $out[] = $command;
+            if ($command[0] === 'layer') {
+                array_push($out, ...self::flat($command[3]));
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * A layer: its backdrop read from the target it lies on, filtered, and laid back; its children drawn into a target of
+     * their own, filtered and laid down. The same steps as VelvetGE's, as operations.
+     *
+     * @param  array<int, mixed>  $command
+     */
+    private function layer(array $command): void
+    {
+        [, $full, $geometry, $children, $alpha, $filter, $backdrop, $clip] = $command;
+        $round = $geometry;
+        if (! is_null($backdrop)) {
+            $by = (int) ceil($backdrop->reach());
+            $outer = (new Region($full->x - $by, $full->y - $by, $full->width + 2 * $by, $full->height + 2 * $by))->intersect($this->surface);
+            $glass = ++$this->slots;
+            $this->operations[] = [Op::BACKDROP, $this->slot, $glass, $outer];
+            $this->filterOp($glass, $outer, $backdrop, false);
+            $this->lay($glass, $clip, 255, $round);
+        }
+
+        $content = ++$this->slots;
+        $parent = $this->slot;
+        $this->operations[] = [Op::TARGET, $content, $full];
+        [$this->slot, $this->scissor] = [$content, null];
+        [$groups, $memberOf, $group, $at] = [$this->groups, $this->memberOf, $this->group, $this->at];
+        $this->plan($children);
+        foreach ($children as $i => $child) {
+            $this->at = $i;
+            $this->command($child);
+        }
+        [$this->groups, $this->memberOf, $this->group, $this->at] = [$groups, $memberOf, $group, $at];
+        $this->operations[] = [Op::TARGET, $parent, null];
+        [$this->slot, $this->scissor] = [$parent, null];
+        $this->filterOp($content, $full, $filter ?? FilterChain::of(), true);
+        $this->lay($content, $clip, $alpha, $round);
+    }
+
+    /** The glass groups of a command list (GlassGroups), for the panes among it to find theirs. */
+    private function plan(array $commands): void
+    {
+        [$this->groups, $this->memberOf, $this->group] = [[], [], null];
+        if (! $this->glass) {
+            return;
+        }
+        $this->groups = GlassGroups::of($commands, $this->surface, $this->box);
+        foreach ($this->groups as $g => $group) {
+            foreach ($group['members'] as $i) {
+                $this->memberOf[$i] = $g;
+            }
+        }
+    }
+
+    /**
+     * A glass pane on a device with its own glass pass: its group's backdrop read and blurred at the group's first pane, then
+     * one draw over the pane's box.
+     *
+     * @param  array<int, mixed>  $command
+     */
+    private function pane(array $command): void
+    {
+        $g = $this->memberOf[$this->at] ?? null;
+        if ($g === null) {
+            return;
+        }
+        $group = $this->groups[$g];
+        if ($this->group !== $g) {
+            // the same region and depths as last frame's backdrop in this place, and nothing under it redrawn: the device keeps its pyramid
+            $region = $group['region'];
+            $key = "{$region->x},{$region->y},{$region->width},{$region->height}|".implode(',', $group['depths']);
+            $n = count($this->backdrops);
+            $this->backdrops[] = $key;
+            $keep = ($this->previous[$n] ?? null) === $key && array_filter($this->damage, fn (Region $d): bool => ! is_null($d->intersect($region))) === [];
+            $this->operations[] = [Op::GLASS_BACKDROP, $this->slot, $region, $group['depths'], $n, $keep];
+            $this->group = $g;
+            $this->scissor = null;
+        }
+        if ($command[5] !== null) {
+            // after the backdrop was read and before the pane: the pane covers its own rounded box
+            $this->command($command[5]);
+        }
+        [$x0, $y0, $x1, $y1] = $command[2];
+        $this->clip($command[6]);
+        $this->operations[] = [Op::GLASS, $this->quad(floor($x0), floor($y0), ceil($x1), ceil($y1)), $command[2], $command[3], Glass::levels($command[4]), $group['region']];
+    }
+
+    /** A filter chain run in place over a region of a layer target. */
+    private function filterOp(int $slot, Region $region, FilterChain $chain, bool $premultiplied): void
+    {
+        $maps = [];
+        $tables = [];
+        foreach ($chain->steps as $i => $step) {
+            if ($step instanceof Displace && ! is_string($step->map)) {
+                $id = spl_object_id($step->map);
+                if (! isset($this->textures[$id])) {
+                    $this->textures[$id] = count($this->textures);
+                    $this->operations[] = [Op::UPLOAD, $this->textures[$id], $step->map];
+                }
+                $maps[$i] = $this->textures[$id];
+            } elseif ($step instanceof Noise && $step->type !== NoiseType::HASH) {
+                $tables[$i] = NativeFilters::noiseTables($step->seed);
+            }
+        }
+        $this->operations[] = [Op::FILTER, $slot, $region, $chain, $premultiplied, $maps, $tables];
+        $this->scissor = null;
+    }
+
+    /** A layer target laid down on the current one: the clip's pixels, as an image placed at the origin, through the layer's rounded box. */
+    private function lay(int $slot, Region $clip, int $alpha, array $round): void
+    {
+        $texture = $this->textures["layer{$slot}"] = count($this->textures);
+        $this->operations[] = [Op::LAYER_SOURCE, $texture, $slot];
+        $this->clip($clip);
+        $this->operations[] = [Op::IMAGE, $this->quad($clip->x, $clip->y, $clip->right(), $clip->bottom()), $texture, Affine::identity(), $alpha, Filter::NEAREST, 0xFFFFFFFF, null, $round];
     }
 
     /** @return list<float> The six vertices of a quad. */
@@ -269,5 +469,46 @@ final class Lowering
         }
 
         return $first;
+    }
+
+    /**
+     * A glass pane as a backdrop layer: blur, saturation, tint, light and opacity as a filter chain over its box.
+     * shortcut: no refraction, rim or grain, and full-size filter passes; upgrade with each device's glass pass (G4).
+     *
+     * @param  array<int, mixed>  $command
+     * @return array<int, mixed>
+     */
+    private static function glassLayer(array $command): array
+    {
+        [$frost, , , $saturation, $light, , $tint, , $alpha] = $command[3];
+        $radius = $command[4] * $frost;
+        $steps = [];
+        $last = \Surface\Contracts\Drawing\Effects\FilterStep::SOURCE;
+        $name = function () use (&$steps): string {
+            return 'g'.count($steps);
+        };
+        if ($radius >= 0.75) {
+            $steps[] = \Surface\Contracts\Drawing\Effects\Blur::spiral($radius, (int) min(64, max(16, ceil($radius * 0.75))), \Surface\Contracts\Drawing\Effects\EdgeMode::DUPLICATE, result: $last = $name());
+        }
+        if ($saturation != 1.0) {
+            $steps[] = \Surface\Contracts\Drawing\Effects\ColorMatrix::saturate($saturation, $last, $last = $name());
+        }
+        if (($tint & 0xFF) > 0) {
+            $veil = $name();
+            $steps[] = new \Surface\Contracts\Drawing\Effects\Flood(new \Surface\NutsAndBolts\Color(($tint >> 24 & 0xFF) / 255, ($tint >> 16 & 0xFF) / 255, ($tint >> 8 & 0xFF) / 255, ($tint & 0xFF) / 255), $veil);
+            $steps[] = new \Surface\Contracts\Drawing\Effects\Composite($last, \Surface\Contracts\Drawing\Effects\CompositeOperator::OVER, in: $veil, result: $last = $name());
+        }
+        if ($light != 0.0) {
+            $steps[] = \Surface\Contracts\Drawing\Effects\ColorMatrix::brightness(1.0, $light, $last, $last = $name());
+        }
+        if ($alpha < 255) {
+            $steps[] = \Surface\Contracts\Drawing\Effects\Composite::arithmetic(\Surface\Contracts\Drawing\Effects\FilterStep::SOURCE, 0.0, $alpha / 255, 1.0 - $alpha / 255, 0.0, $last, $last = $name());
+        }
+        if ($steps === []) {
+            $steps[] = \Surface\Contracts\Drawing\Effects\ColorMatrix::brightness(1.0);
+        }
+
+        // shortcut: its shadow goes first, so the backdrop the layer reads has it; upgrade when a device without DrawsGlass is in use
+        return ['layer', $command[1], $command[2], [], 255, null, \Surface\Contracts\Drawing\Effects\FilterChain::of(...$steps), $command[6]];
     }
 }

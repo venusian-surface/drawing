@@ -35,7 +35,7 @@ class DrawingManager
         'sdl3' => 'jovian/venusian-sdl3',
     ];
 
-    protected const array VELVET_ARGUMENTS = ['output', 'framebuffer', 'width', 'height', 'mode', 'format', 'page_rows', 'frames', 'framebuffers', 'rasterize', 'edges'];
+    protected const array VELVET_ARGUMENTS = ['output', 'framebuffer', 'width', 'height', 'mode', 'format', 'page_rows', 'frames', 'framebuffers', 'rasterize', 'edges', 'direct_fill'];
 
     /** @var array<string, Closure(array<string, mixed>, self): RenderingEngine> */
     protected array $creators = [];
@@ -100,7 +100,9 @@ class DrawingManager
      * 'height', 'mode' (full, dirty, epaper, paged with 'page_rows', ring
      * with 'frames'), 'format' (RGBA8 unless given) and 'framebuffers' (the
      * driver; config's unless given). 'rasterize' names the rasterize driver,
-     * 'edges' the edge mode; both have defaults.
+     * 'edges' the edge mode; both have defaults. 'direct_fill' is 'auto' (shapes
+     * painted straight into the framebuffer where both drivers are extended) or
+     * 'off' (through paintSpans()); config's drawing.velvet.direct_fill unless given.
      *
      * @param  array<string, mixed>  $args
      */
@@ -112,7 +114,12 @@ class DrawingManager
             }
         }
 
-        return new VelvetGE($this->framebufferFrom($args), $this->rasterize->driver($args['rasterize'] ?? null), $this->edgesFrom($args));
+        $direct = $args['direct_fill'] ?? $this->config->get('drawing.velvet.direct_fill', 'auto');
+        if (! in_array($direct, ['auto', 'off'], true)) {
+            throw new DrawingException("'direct_fill' is 'auto' or 'off', got ".var_export($direct, true).'.');
+        }
+
+        return new VelvetGE($this->framebufferFrom($args), $this->rasterize->driver($args['rasterize'] ?? null), $this->edgesFrom($args), $direct === 'auto');
     }
 
     /**
